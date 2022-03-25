@@ -26,6 +26,7 @@ from PIL import ImageColor
 from PIL import ImageDraw
 from PIL import ImageFilter
 from PIL import ImageFont
+from PIL import ImageOps
 
 from .query_integral_image import query_integral_image
 from .tokenization import unigrams_and_bigrams, process_tokens
@@ -485,7 +486,10 @@ class WordCloud(object):
                                     for word, freq in frequencies_org])
 
         # start drawing grey image
+        frequenciesMod = []
+        fIndex = 0
         for word, freq in frequencies:
+            print(word)
             if freq == 0:
                 continue
             # select the font size
@@ -493,19 +497,24 @@ class WordCloud(object):
             if rs != 0:
                 font_size = int(round((rs * (freq / float(last_freq))
                                        + (1 - rs)) * font_size))
-            if random_state.random() < self.prefer_horizontal:
+            if random_state.random() < (self.prefer_horizontal / 2):
                 orientation = None
             else:
                 orientation = Image.ROTATE_90
+            if fIndex in [0,1]:
+                orientation = None
             tried_other_orientation = False
             while True:
                 # try to find a position
                 font = ImageFont.truetype(self.font_path, font_size)
                 # transpose font optionally
-                transposed_font = ImageFont.TransposedFont(
-                    font, orientation=orientation)
+                transposed_font = ImageFont.TransposedFont(font, orientation=orientation)
                 # get size of resulting text
-                box_size = draw.textsize(word, font=transposed_font)
+                box_size = font.getsize_multiline(word)
+                if orientation != None:
+                    box_size = box_size[::-1]
+                # print("[phrase:{}.{}] : {}".format(word,font_size,box_size))
+                # box_size = draw.textsize_multiline(word, font=transposed_font)
                 # find possible places using integral image:
                 result = occupancy.sample_position(box_size[1] + self.margin,
                                                    box_size[0] + self.margin,
@@ -515,41 +524,78 @@ class WordCloud(object):
                     break
                 # if we didn't find a place, make font smaller
                 # but first try to rotate!
-                if not tried_other_orientation and self.prefer_horizontal < 1:
+                # if not tried_other_orientation and self.prefer_horizontal < 1:
+                if self.prefer_horizontal < 1 and fIndex not in [0,1]:
                     orientation = (Image.ROTATE_90 if orientation is None else
-                                   Image.ROTATE_90)
-                    tried_other_orientation = True
+                                  (Image.ROTATE_270 if orientation == Image.ROTATE_90 else None))
                 else:
-                    font_size -= self.font_step
                     orientation = None
-
+                font_size -= self.font_step
+            
             if font_size < self.min_font_size:
                 # we were unable to draw any more
                 break
 
             x, y = np.array(result) + self.margin // 2
             # actually draw the text
-            draw.text((y, x), word, fill="white", font=transposed_font)
-            positions.append((x, y))
-            orientations.append(orientation)
-            font_sizes.append(font_size)
-            colors.append(self.color_func(word, font_size=font_size,
-                                          position=(x, y),
-                                          orientation=orientation,
-                                          random_state=random_state,
-                                          font_path=self.font_path))
-            # recompute integral image
-            if self.mask is None:
-                img_array = np.asarray(img_grey)
+            if len(word.split('\n')) > 1 and orientation != None:
+                for line in (word.split('\n') if orientation == Image.ROTATE_90 else word.split('\n')[::-1]):
+                    frequenciesMod.append((line,1))
+                    draw.text((y,x), line, fill="white", font=transposed_font)
+                    positions.append((x, y))
+                    orientations.append(orientation)
+                    font_sizes.append(font_size)
+                    colors.append(self.color_func(line, font_size=font_size,
+                                                position=(x, y),
+                                                orientation=orientation,
+                                                random_state=random_state,
+                                                font_path=self.font_path))
+                    if self.mask is None:
+                        img_array = np.asarray(img_grey)
+                    else:
+                        img_array = np.asarray(img_grey) + boolean_mask
+                    # recompute bottom right
+                    # the order of the cumsum's is important for speed ?!
+                    print("[printV] (x,y): ({},{}) {}".format(x,y,line))
+                    try:
+                        occupancy.update(img_array, int(x), int(y))
+                    except Exception as e:
+                        print("ERROR: (x,y) ({},{}): {}".format(x,y,e))
+                    else:
+                        print("[occupany] {},{}".format(int(x),int(y)))
+                    last_freq = freq
+                    y += int(font.getsize(line)[1]) + 1
             else:
-                img_array = np.asarray(img_grey) + boolean_mask
-            # recompute bottom right
-            # the order of the cumsum's is important for speed ?!
-            occupancy.update(img_array, x, y)
-            last_freq = freq
+                print("[printH] (x,y): ({},{}) {}".format(x,y,word))
+                frequenciesMod.append((word,1))
+                draw.text((y, x), word, fill="white", font=transposed_font)
+                positions.append((x, y))
+                orientations.append(orientation)
+                font_sizes.append(font_size)
+                colors.append(self.color_func(word, font_size=font_size,
+                                            position=(x, y),
+                                            orientation=orientation,
+                                            random_state=random_state,
+                                            font_path=self.font_path))
+                # recompute integral image
+                if self.mask is None:
+                    img_array = np.asarray(img_grey)
+                else:
+                    img_array = np.asarray(img_grey) + boolean_mask
+                # recompute bottom right
+                # the order of the cumsum's is important for speed ?!
+                try:
+                    occupancy.update(img_array, int(x), int(y))
+                except Exception as e:
+                    print("ERROR: (x,y) ({},{}): {}".format(x,y,e))
+                else:
+                    print("[occupany] {},{}".format(int(x),int(y)))
 
-        self.layout_ = list(zip(frequencies, font_sizes, positions,
+                last_freq = freq
+
+        self.layout_ = list(zip(frequenciesMod, font_sizes, positions,
                                 orientations, colors))
+        
         return self
 
     def process_text(self, text):
@@ -725,6 +771,40 @@ class WordCloud(object):
         img = self.to_image()
         img.save(filename, optimize=True)
         return self
+
+    def interpolate(self,f_co, t_co, interval):
+        det_co =[(t - f) / interval for f , t in zip(f_co, t_co)]
+        for i in range(interval):
+            yield [round(f + det * i) for f, det in zip(f_co, det_co)]
+
+    def gradient(self,size,co1,co2):
+        gradient = Image.new('RGBA', size, color=0)
+        draw = ImageDraw.Draw(gradient)
+        for i, color in enumerate(self.interpolate(co1, co2, size[0] * 2)):
+            draw.line([(i, 0), (0, i)], tuple(color), width=1)
+        return gradient
+
+    def to_b64(self):
+        im = self.to_image()
+        gradient = self.gradient(im.size,(0, 255, 255),(255, 0, 0))
+        print("gradient info: {}".format(gradient.info))
+        print("gradient size: {}".format(gradient.size))
+        print("gradient mode: {}".format(gradient.mode))
+        print("image info:    {}".format(im.info))
+        print("image size:    {}".format(im.size))
+        print("image mode:    {}".format(im.mode))
+        # im_composite = Image.composite(gradient, im)
+        im_alpha = im.getchannel('A')
+        r,g,b,a = Image.alpha_composite(gradient, im).split()
+        im_finished = Image.merge('RGBA',(r,g,b,ImageOps.invert(im_alpha)))
+        # im_composite = Image.alpha_composite(im, gradient)
+        # im_composite.show()
+        import base64
+        from io import BytesIO
+        buffered = BytesIO()
+        im_finished.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue())
+        return img_str
 
     def to_array(self):
         """Convert to numpy array.
