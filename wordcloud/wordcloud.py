@@ -7,7 +7,7 @@
 # License: MIT
 
 from __future__ import division
-
+from asyncio.constants import LOG_THRESHOLD_FOR_CONNLOST_WRITES
 import warnings
 from random import Random
 import io
@@ -16,7 +16,10 @@ import re
 import base64
 import sys
 import colorsys
+import math
 import matplotlib
+from io import BytesIO
+from pyparsing import Or
 import numpy as np
 from operator import itemgetter
 from xml.sax import saxutils
@@ -34,7 +37,11 @@ from .tokenization import unigrams_and_bigrams, process_tokens
 FILE = os.path.dirname(__file__)
 FONT_PATH = os.environ.get('FONT_PATH', os.path.join(FILE, 'DroidSansMono.ttf'))
 STOPWORDS = set(map(str.strip, open(os.path.join(FILE, 'stopwords')).readlines()))
-
+ORIENTATIONS = {
+    None: 2,
+    Image.ROTATE_90: 1,
+    Image.ROTATE_270: 1,
+}
 
 class IntegralOccupancyMap(object):
     def __init__(self, height, width, mask):
@@ -315,7 +322,8 @@ class WordCloud(object):
                  relative_scaling='auto', regexp=None, collocations=True,
                  colormap=None, normalize_plurals=True, contour_width=0,
                  contour_color='black', repeat=False,
-                 include_numbers=False, min_word_length=0, collocation_threshold=30):
+                 include_numbers=False, min_word_length=0, collocation_threshold=30,
+                 image_format='WEBP', render_scale=1):
         if font_path is None:
             font_path = FONT_PATH
         if color_func is None and colormap is None:
@@ -327,8 +335,6 @@ class WordCloud(object):
         self.colormap = colormap
         self.collocations = collocations
         self.font_path = font_path
-        self.width = width
-        self.height = height
         self.margin = margin
         self.prefer_horizontal = prefer_horizontal
         self.mask = mask
@@ -341,6 +347,10 @@ class WordCloud(object):
         self.min_font_size = min_font_size
         self.font_step = font_step
         self.regexp = regexp
+        self.image_format = image_format
+        self.render_scale = render_scale
+        self.width = int(render_scale * width)
+        self.height = int(render_scale * height)
         if isinstance(random_state, int):
             random_state = Random(random_state)
         self.random_state = random_state
@@ -436,40 +446,13 @@ class WordCloud(object):
         img_grey = Image.new("L", (width, height))
         draw = ImageDraw.Draw(img_grey)
         img_array = np.asarray(img_grey)
-        font_sizes, positions, orientations, colors = [], [], [], []
+        font_sizes, positions, orientations, groupOrientations, colors = [], [], [], [], []
 
         last_freq = 1.
 
         if max_font_size is None:
-            # if not provided use default font_size
-            max_font_size = self.max_font_size
-
-        if max_font_size is None:
-            # figure out a good font size by trying to draw with
-            # just the first two words
-            if len(frequencies) == 1:
-                # we only have one word. We make it big!
-                font_size = self.height
-            else:
-                self.generate_from_frequencies(dict(frequencies[:2]),
-                                               max_font_size=self.height)
-                # find font sizes
-                sizes = [x[1] for x in self.layout_]
-                try:
-                    font_size = int(2 * sizes[0] * sizes[1]
-                                    / (sizes[0] + sizes[1]))
-                # quick fix for if self.layout_ contains less than 2 values
-                # on very small images it can be empty
-                except IndexError:
-                    try:
-                        font_size = sizes[0]
-                    except IndexError:
-                        raise ValueError(
-                            "Couldn't find space to draw. Either the Canvas size"
-                            " is too small or too much of the image is masked "
-                            "out.")
-        else:
-            font_size = max_font_size
+            max_font_size = self.max_font_size # if not provided use default font_size
+        font_size = max_font_size
 
         # we set self.words_ here because we called generate_from_frequencies
         # above... hurray for good design?
@@ -486,8 +469,7 @@ class WordCloud(object):
                                     for word, freq in frequencies_org])
 
         # start drawing grey image
-        frequenciesMod = []
-        fIndex = 0
+        frequenciesMod = [] 
         for word, freq in frequencies:
             print(word)
             if freq == 0:
@@ -495,45 +477,62 @@ class WordCloud(object):
             # select the font size
             rs = self.relative_scaling
             if rs != 0:
-                font_size = int(round((rs * (freq / float(last_freq))
-                                       + (1 - rs)) * font_size))
-            if random_state.random() < (self.prefer_horizontal / 2):
-                orientation = None
+                # font_size = int(max_font_size)
+                font_size = int(round((rs * (freq / float(last_freq)) + (1 - rs)) * font_size))
             else:
-                orientation = Image.ROTATE_90
-            if fIndex in [0,1]:
+                font_size = int(max_font_size)
+            # pick an orientation
+            if len(groupOrientations) in [0,1]:
                 orientation = None
-            tried_other_orientation = False
+            else:                
+                usedOrientations = {k : len([o for o in groupOrientations if o == k]) for k in ORIENTATIONS.keys()}
+                m = 1
+                for k,v in ORIENTATIONS.items():
+                    m = max(m, math.ceil((usedOrientations[k]) / v))
+                desiredOrientations = {k: ((m * ORIENTATIONS[k]) - usedOrientations[k]) for k in ORIENTATIONS.keys()}
+                desiredOrientations = [k for k,v in desiredOrientations.items() if v > 0]
+                if len(desiredOrientations) == 0:
+                    desiredOrientations = [o for o in ORIENTATIONS.keys()]
+                orientation = desiredOrientations[int(len(desiredOrientations) * random_state.random()) % len(desiredOrientations)]
+                remainingOrientations = [o for o in desiredOrientations if o != orientation]
+            
+            override = False
+            loopCount = 0
             while True:
+                if loopCount > 10000:
+                    break
                 # try to find a position
-                font = ImageFont.truetype(self.font_path, font_size)
+                try:
+                    font = ImageFont.truetype(self.font_path, font_size)
+                except Exception as e:
+                    font_size = int(max_font_size)
+                    font = ImageFont.truetype(self.font_path, font_size)
                 # transpose font optionally
                 transposed_font = ImageFont.TransposedFont(font, orientation=orientation)
                 # get size of resulting text
+                # we dont use the transposed font because it returns bad data
+                # instead we use the regular font and transpose the results
                 box_size = font.getsize_multiline(word)
                 if orientation != None:
                     box_size = box_size[::-1]
-                # print("[phrase:{}.{}] : {}".format(word,font_size,box_size))
-                # box_size = draw.textsize_multiline(word, font=transposed_font)
                 # find possible places using integral image:
                 result = occupancy.sample_position(box_size[1] + self.margin,
                                                    box_size[0] + self.margin,
                                                    random_state)
-                if result is not None or font_size < self.min_font_size:
-                    # either we found a place or font-size went too small
+                if result is not None: # We Found a Spot
                     break
-                # if we didn't find a place, make font smaller
-                # but first try to rotate!
-                # if not tried_other_orientation and self.prefer_horizontal < 1:
-                if self.prefer_horizontal < 1 and fIndex not in [0,1]:
-                    orientation = (Image.ROTATE_90 if orientation is None else
-                                  (Image.ROTATE_270 if orientation == Image.ROTATE_90 else None))
-                else:
-                    orientation = None
+                elif not(override) and (font_size < self.min_font_size): # Font is too small, start over
+                    if len(remainingOrientations) > 0:
+                        orientation = [o for o in remainingOrientations][0]
+                    else:
+                        orientation = None
+                        override = True
+                    remainingOrientations = [o for o in remainingOrientations if o != orientation]
+                    font_size = int(max_font_size)
+
                 font_size -= self.font_step
-            
-            if font_size < self.min_font_size:
-                # we were unable to draw any more
+
+            if not(override) and (font_size < self.min_font_size):
                 break
 
             x, y = np.array(result) + self.margin // 2
@@ -565,12 +564,14 @@ class WordCloud(object):
                         print("[occupany] {},{}".format(int(x),int(y)))
                     last_freq = freq
                     y += int(font.getsize(line)[1]) + 1
+                groupOrientations.append(orientation)
             else:
                 print("[printH] (x,y): ({},{}) {}".format(x,y,word))
                 frequenciesMod.append((word,1))
                 draw.text((y, x), word, fill="white", font=transposed_font)
                 positions.append((x, y))
                 orientations.append(orientation)
+                groupOrientations.append(orientation)
                 font_sizes.append(font_size)
                 colors.append(self.color_func(word, font_size=font_size,
                                             position=(x, y),
@@ -710,8 +711,15 @@ class WordCloud(object):
             pos = (int(position[1] * self.scale),
                    int(position[0] * self.scale))
             draw.text(pos, word, fill=color, font=transposed_font)
-
-        return self._draw_contour(img=img)
+        # Overlay Text over background.png
+        im = self._draw_contour(img=img)
+        gradient = Image.open('./background.png').resize((self.width,self.height))        
+        im_alpha = im.getchannel('A')
+        r,g,b,a = Image.alpha_composite(gradient, im).split()
+        im_finished = Image.merge('RGBA',(r,g,b,ImageOps.invert(im_alpha)))
+        if (self.render_scale != 1):
+            im_finished = im_finished.resize((int(self.width//self.render_scale),int(self.height//self.render_scale)))
+        return im_finished
 
     def recolor(self, random_state=None, color_func=None, colormap=None):
         """Recolor existing layout.
@@ -772,38 +780,18 @@ class WordCloud(object):
         img.save(filename, optimize=True)
         return self
 
-    def interpolate(self,f_co, t_co, interval):
-        det_co =[(t - f) / interval for f , t in zip(f_co, t_co)]
-        for i in range(interval):
-            yield [round(f + det * i) for f, det in zip(f_co, det_co)]
-
-    def gradient(self,size,co1,co2):
-        gradient = Image.new('RGBA', size, color=0)
-        draw = ImageDraw.Draw(gradient)
-        for i, color in enumerate(self.interpolate(co1, co2, size[0] * 2)):
-            draw.line([(i, 0), (0, i)], tuple(color), width=1)
-        return gradient
+    def to_buffer(self):
+        # Convert to buffer
+        im = self.to_image()
+        buffer = BytesIO()
+        im.save(buffer, format=self.image_format)
+        buffer.seek(0)
+        return buffer
 
     def to_b64(self):
-        im = self.to_image()
-        gradient = self.gradient(im.size,(0, 255, 255),(255, 0, 0))
-        print("gradient info: {}".format(gradient.info))
-        print("gradient size: {}".format(gradient.size))
-        print("gradient mode: {}".format(gradient.mode))
-        print("image info:    {}".format(im.info))
-        print("image size:    {}".format(im.size))
-        print("image mode:    {}".format(im.mode))
-        # im_composite = Image.composite(gradient, im)
-        im_alpha = im.getchannel('A')
-        r,g,b,a = Image.alpha_composite(gradient, im).split()
-        im_finished = Image.merge('RGBA',(r,g,b,ImageOps.invert(im_alpha)))
-        # im_composite = Image.alpha_composite(im, gradient)
-        # im_composite.show()
-        import base64
-        from io import BytesIO
-        buffered = BytesIO()
-        im_finished.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue())
+        # Convert to b64 encoded image
+        buffer = self.to_buffer()
+        img_str = base64.b64encode(buffer.getvalue())
         return img_str
 
     def to_array(self):
